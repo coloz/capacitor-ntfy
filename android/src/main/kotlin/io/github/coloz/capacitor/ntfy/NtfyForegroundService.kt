@@ -1,0 +1,324 @@
+package io.github.coloz.capacitor.ntfy
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.os.Build
+import android.os.IBinder
+import android.util.Base64
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.app.ServiceCompat
+import java.io.BufferedReader
+import java.io.IOException
+import java.io.InputStreamReader
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
+import java.util.concurrent.ThreadLocalRandom
+import kotlin.math.min
+import org.json.JSONObject
+
+class NtfyForegroundService : Service() {
+    private lateinit var store: NtfyStore
+    private lateinit var connectivityManager: ConnectivityManager
+    private val networkMonitor = Object()
+
+    @Volatile private var networkAvailable = false
+    @Volatile private var activeConnection: HttpURLConnection? = null
+    @Volatile private var worker: Thread? = null
+    @Volatile private var generation = 0L
+    @Volatile private var currentConfig: NtfyConfig? = null
+
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) = networkChanged()
+        override fun onLost(network: Network) = networkChanged()
+        override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) = networkChanged()
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        store = NtfyStore(this)
+        connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        networkAvailable = hasNetwork()
+        runCatching { connectivityManager.registerDefaultNetworkCallback(networkCallback) }
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP) {
+            store.setEnabled(false)
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        val config = store.loadConfig()
+        if (config == null || !store.isEnabled()) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        currentConfig = config
+        createNotificationChannels(config)
+        startOrUpdateForeground(config, "正在启动")
+        startConnection(config)
+        return START_STICKY
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onDestroy() {
+        generation += 1
+        activeConnection?.disconnect()
+        activeConnection = null
+        synchronized(networkMonitor) { networkMonitor.notifyAll() }
+        runCatching { connectivityManager.unregisterNetworkCallback(networkCallback) }
+        val status = statusJson("stopped", running = false, connected = false)
+        store.saveStatus(status)
+        NtfyEventBus.statusChanged(status)
+        super.onDestroy()
+    }
+
+    private fun startConnection(config: NtfyConfig) {
+        generation += 1
+        val runId = generation
+        activeConnection?.disconnect()
+        synchronized(networkMonitor) { networkMonitor.notifyAll() }
+        worker = Thread({ connectionLoop(config, runId) }, "capacitor-ntfy-stream").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    private fun connectionLoop(config: NtfyConfig, runId: Long) {
+        var attempt = 0
+        while (isActive(runId)) {
+            if (!networkAvailable) {
+                emitStatus("waitingForNetwork", false, null, null, runId)
+                waitForSignal(60_000L)
+                continue
+            }
+
+            try {
+                emitStatus(if (attempt == 0) "connecting" else "reconnecting", false, null, null, runId)
+                subscribe(config, runId)
+                if (!isActive(runId)) return
+                throw IOException("ntfy stream ended")
+            } catch (error: Exception) {
+                if (!isActive(runId)) return
+                if (!networkAvailable) continue
+                attempt += 1
+                val retrySeconds = min(60, 1 shl min(attempt, 6))
+                emitStatus(
+                    state = "reconnecting",
+                    connected = false,
+                    error = error.message ?: error.javaClass.simpleName,
+                    retrySeconds = retrySeconds,
+                    runId = runId,
+                )
+                val jitter = ThreadLocalRandom.current().nextLong(0, 1_000)
+                waitForSignal(retrySeconds * 1_000L + jitter)
+            } finally {
+                activeConnection?.disconnect()
+                activeConnection = null
+            }
+        }
+    }
+
+    private fun subscribe(config: NtfyConfig, runId: Long) {
+        val since = store.getLastMessageId(config) ?: config.initialSince
+        val encodedSince = URLEncoder.encode(since, Charsets.UTF_8.name())
+        val topics = config.topics.joinToString(",")
+        val url = URL("${config.baseUrl}/$topics/json?since=$encodedSince")
+        val connection = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 15_000
+            readTimeout = 90_000
+            useCaches = false
+            setRequestProperty("Accept", "application/x-ndjson, application/json")
+            setRequestProperty("User-Agent", "capacitor-ntfy/0.1 Android")
+            setAuthorization(config)
+        }
+        activeConnection = connection
+        val responseCode = connection.responseCode
+        if (responseCode !in 200..299) {
+            val detail = connection.errorStream?.bufferedReader()?.use { it.readText().take(300) }
+            throw IOException("ntfy HTTP $responseCode${detail?.let { ": $it" } ?: ""}")
+        }
+
+        emitStatus("connected", true, null, null, runId)
+        BufferedReader(InputStreamReader(connection.inputStream, Charsets.UTF_8)).use { reader ->
+            while (isActive(runId)) {
+                val line = reader.readLine() ?: break
+                if (line.isBlank()) continue
+                val raw = JSONObject(line)
+                when (raw.optString("event")) {
+                    "open" -> emitStatus("connected", true, null, null, runId)
+                    "message" -> handleMessage(raw, config, runId)
+                }
+            }
+        }
+    }
+
+    private fun handleMessage(raw: JSONObject, config: NtfyConfig, runId: Long) {
+        if (!isActive(runId)) return
+        val message = NtfyMessageJson.fromRaw(raw)
+        store.saveMessage(message, config)
+        message.optString("id").takeIf { it.isNotBlank() }?.let { store.saveLastMessageId(config, it) }
+        NtfyEventBus.messageReceived(message)
+        if (config.showNotifications) showMessageNotification(message, config)
+    }
+
+    private fun HttpURLConnection.setAuthorization(config: NtfyConfig) {
+        when {
+            !config.token.isNullOrBlank() -> setRequestProperty("Authorization", "Bearer ${config.token}")
+            !config.username.isNullOrBlank() -> {
+                val credentials = "${config.username}:${config.password.orEmpty()}"
+                val encoded = Base64.encodeToString(credentials.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+                setRequestProperty("Authorization", "Basic $encoded")
+            }
+        }
+    }
+
+    private fun emitStatus(
+        state: String,
+        connected: Boolean,
+        error: String?,
+        retrySeconds: Int?,
+        runId: Long,
+    ) {
+        if (!isActive(runId)) return
+        val status = statusJson(state, running = true, connected = connected).apply {
+            if (error == null) remove("lastError") else put("lastError", error)
+            if (retrySeconds == null) remove("retryInSeconds") else put("retryInSeconds", retrySeconds)
+        }
+        store.saveStatus(status)
+        NtfyEventBus.statusChanged(status)
+        currentConfig?.let {
+            val text = when (state) {
+                "connected" -> it.foregroundText
+                "waitingForNetwork" -> "等待网络连接"
+                "reconnecting" -> "连接中断，正在重试"
+                else -> "正在连接 ntfy"
+            }
+            startOrUpdateForeground(it, text)
+        }
+    }
+
+    private fun statusJson(state: String, running: Boolean, connected: Boolean): JSONObject {
+        val config = currentConfig
+        return JSONObject().apply {
+            put("state", state)
+            put("running", running)
+            put("connected", connected)
+            if (config != null) {
+                put("baseUrl", config.baseUrl)
+                put("topics", org.json.JSONArray(config.topics))
+                store.getLastMessageId(config)?.let { put("lastMessageId", it) }
+            }
+        }
+    }
+
+    private fun createNotificationChannels(config: NtfyConfig) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(
+            NotificationChannel(config.serviceChannelId, config.serviceChannelName, NotificationManager.IMPORTANCE_LOW).apply {
+                description = "保持与 ntfy 服务器的实时连接"
+                setShowBadge(false)
+            },
+        )
+        manager.createNotificationChannel(
+            NotificationChannel(config.messageChannelId, config.messageChannelName, NotificationManager.IMPORTANCE_HIGH),
+        )
+    }
+
+    private fun startOrUpdateForeground(config: NtfyConfig, text: String) {
+        val notification = NotificationCompat.Builder(this, config.serviceChannelId)
+            .setSmallIcon(notificationIcon())
+            .setContentTitle(config.foregroundTitle)
+            .setContentText(text)
+            .setContentIntent(appPendingIntent(FOREGROUND_NOTIFICATION_ID))
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .build()
+        val serviceType = if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0
+        ServiceCompat.startForeground(this, FOREGROUND_NOTIFICATION_ID, notification, serviceType)
+    }
+
+    private fun showMessageNotification(message: JSONObject, config: NtfyConfig) {
+        val id = message.optString("id", System.nanoTime().toString()).hashCode() and 0x7fffffff
+        val notification = NotificationCompat.Builder(this, config.messageChannelId)
+            .setSmallIcon(notificationIcon())
+            .setContentTitle(message.optString("title").ifBlank { message.optString("topic", "ntfy") })
+            .setContentText(message.optString("message"))
+            .setStyle(NotificationCompat.BigTextStyle().bigText(message.optString("message")))
+            .setContentIntent(appPendingIntent(id))
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setPriority(notificationPriority(message.optInt("priority", 3)))
+            .setAutoCancel(true)
+            .build()
+        runCatching { NotificationManagerCompat.from(this).notify(MESSAGE_NOTIFICATION_BASE + id % 100_000, notification) }
+    }
+
+    private fun notificationPriority(value: Int): Int = when (value) {
+        5 -> NotificationCompat.PRIORITY_MAX
+        4 -> NotificationCompat.PRIORITY_HIGH
+        2 -> NotificationCompat.PRIORITY_LOW
+        1 -> NotificationCompat.PRIORITY_MIN
+        else -> NotificationCompat.PRIORITY_DEFAULT
+    }
+
+    private fun notificationIcon(): Int = applicationInfo.icon.takeIf { it != 0 }
+        ?: android.R.drawable.stat_notify_sync_noanim
+
+    private fun appPendingIntent(requestCode: Int): PendingIntent? {
+        val launchIntent = packageManager.getLaunchIntentForPackage(packageName)?.apply {
+            addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        } ?: return null
+        return PendingIntent.getActivity(
+            this,
+            requestCode,
+            launchIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+    }
+
+    private fun networkChanged() {
+        val available = hasNetwork()
+        val changed = available != networkAvailable
+        networkAvailable = available
+        if (changed) activeConnection?.disconnect()
+        synchronized(networkMonitor) { networkMonitor.notifyAll() }
+    }
+
+    private fun hasNetwork(): Boolean {
+        val network = connectivityManager.activeNetwork ?: return false
+        val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return false
+        return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    }
+
+    private fun waitForSignal(milliseconds: Long) {
+        synchronized(networkMonitor) {
+            runCatching { networkMonitor.wait(milliseconds) }
+        }
+    }
+
+    private fun isActive(runId: Long): Boolean = runId == generation && store.isEnabled()
+
+    companion object {
+        const val ACTION_START = "io.github.coloz.capacitor.ntfy.START"
+        const val ACTION_STOP = "io.github.coloz.capacitor.ntfy.STOP"
+        private const val FOREGROUND_NOTIFICATION_ID = 42_600
+        private const val MESSAGE_NOTIFICATION_BASE = 50_000
+    }
+}

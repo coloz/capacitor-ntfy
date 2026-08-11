@@ -1,6 +1,6 @@
 {
   "name": "capacitor-ntfy",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Capacitor Android foreground-service client for self-hosted ntfy servers",
   "main": "dist/plugin.cjs.js",
   "module": "dist/esm/index.js",
@@ -15,19 +15,23 @@
     "Package.swift",
     "CapacitorNtfy.podspec"
   ],
-  "author": "Codex Demo",
+  "author": "coloz",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/example/capacitor-ntfy.git"
+    "url": "git+https://github.com/coloz/capacitor-ntfy.git"
   },
   "bugs": {
-    "url": "https://github.com/example/capacitor-ntfy/issues"
+    "url": "https://github.com/coloz/capacitor-ntfy/issues"
   },
   "keywords": [
     "capacitor",
     "plugin",
-    "native"
+    "native",
+    "ntfy",
+    "notifications",
+    "android",
+    "foreground-service"
   ],
   "scripts": {
     "verify": "npm run verify:ios && npm run verify:android && npm run verify:web",
@@ -46,10 +50,10 @@
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {
-    "@capacitor/android": "^8.0.0",
-    "@capacitor/core": "^8.0.0",
+    "@capacitor/android": "^8.4.1",
+    "@capacitor/core": "^8.4.1",
     "@capacitor/docgen": "^0.3.1",
-    "@capacitor/ios": "^8.0.0",
+    "@capacitor/ios": "^8.4.1",
     "@ionic/eslint-config": "^0.4.0",
     "@ionic/prettier-config": "^4.0.0",
     "@ionic/swiftlint-config": "^2.0.0",

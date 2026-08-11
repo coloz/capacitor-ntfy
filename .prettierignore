@@ -1,1 +1,11 @@
-example-app
+dist
+node_modules
+android/.gradle
+android/build
+demo/dist
+demo/node_modules
+demo/android/.gradle
+demo/android/build
+demo/android/app/build
+demo/android/app/src/main/assets
+demo/android/capacitor-cordova-android-plugins

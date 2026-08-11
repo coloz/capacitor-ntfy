@@ -1,3 +1,6 @@
 build
 dist
-example-app
+node_modules
+demo/dist
+demo/node_modules
+demo/android/app/src/main/assets
