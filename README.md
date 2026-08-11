@@ -76,7 +76,9 @@ Do not place a privileged server token in client code. Give each device narrowly
 
 ## Android customization
 
-Notification channel IDs are created the first time the service starts and Android keeps user channel choices. Changing a channel's importance programmatically after creation has no effect; use a new channel ID when required.
+The foreground service uses one low-importance channel. Messages follow ntfy's priority model and use five channels derived from `messageChannelId`: `_min`, `_low`, `_default`, `_high`, and `_urgent`. This lets users configure sound, vibration, pop-over behavior, and Do Not Disturb handling separately for every priority.
+
+Notification channel IDs are created the first time the service starts and Android keeps user channel choices. Changing a channel's importance programmatically after creation has no effect; use a new base channel ID when required. The unsuffixed message channel from earlier development builds is no longer used.
 
 The plugin uses the host application's launcher icon as its default notification small icon. A production application should replace this with a dedicated monochrome notification asset in a fork or expose an application-specific resource.
 
@@ -311,23 +313,23 @@ removeAllListeners() => Promise<void>
 
 #### NtfyStartOptions
 
-| Prop                     | Type                  | Description                                                                 |
-| ------------------------ | --------------------- | --------------------------------------------------------------------------- |
-| **`baseUrl`**            | <code>string</code>   | ntfy server URL, for example https://ntfy.sh. HTTPS is recommended.         |
-| **`topics`**             | <code>string[]</code> | One or more ntfy topic names.                                               |
-| **`token`**              | <code>string</code>   | ntfy access token. Takes precedence over username/password.                 |
-| **`username`**           | <code>string</code>   |                                                                             |
-| **`password`**           | <code>string</code>   |                                                                             |
-| **`initialSince`**       | <code>string</code>   | Initial ntfy `since` value. Defaults to `10m`.                              |
-| **`autoStartOnBoot`**    | <code>boolean</code>  | Restart the foreground service after a device reboot. Defaults to true.     |
-| **`showNotifications`**  | <code>boolean</code>  | Show a local notification for each received ntfy message. Defaults to true. |
-| **`historyLimit`**       | <code>number</code>   | Maximum number of messages retained by the plugin. Defaults to 100.         |
-| **`foregroundTitle`**    | <code>string</code>   |                                                                             |
-| **`foregroundText`**     | <code>string</code>   |                                                                             |
-| **`serviceChannelId`**   | <code>string</code>   |                                                                             |
-| **`serviceChannelName`** | <code>string</code>   |                                                                             |
-| **`messageChannelId`**   | <code>string</code>   |                                                                             |
-| **`messageChannelName`** | <code>string</code>   |                                                                             |
+| Prop                     | Type                  | Description                                                                                 |
+| ------------------------ | --------------------- | ------------------------------------------------------------------------------------------- |
+| **`baseUrl`**            | <code>string</code>   | ntfy server URL, for example https://ntfy.sh. HTTPS is recommended.                         |
+| **`topics`**             | <code>string[]</code> | One or more ntfy topic names.                                                               |
+| **`token`**              | <code>string</code>   | ntfy access token. Takes precedence over username/password.                                 |
+| **`username`**           | <code>string</code>   |                                                                                             |
+| **`password`**           | <code>string</code>   |                                                                                             |
+| **`initialSince`**       | <code>string</code>   | Initial ntfy `since` value. Defaults to `10m`.                                              |
+| **`autoStartOnBoot`**    | <code>boolean</code>  | Restart the foreground service after a device reboot. Defaults to true.                     |
+| **`showNotifications`**  | <code>boolean</code>  | Show a local notification for each received ntfy message. Defaults to true.                 |
+| **`historyLimit`**       | <code>number</code>   | Maximum number of messages retained by the plugin. Defaults to 100.                         |
+| **`foregroundTitle`**    | <code>string</code>   |                                                                                             |
+| **`foregroundText`**     | <code>string</code>   |                                                                                             |
+| **`serviceChannelId`**   | <code>string</code>   |                                                                                             |
+| **`serviceChannelName`** | <code>string</code>   |                                                                                             |
+| **`messageChannelId`**   | <code>string</code>   | Base ID for five priority-specific message channels. Defaults to `capacitor_ntfy_messages`. |
+| **`messageChannelName`** | <code>string</code>   | Base name shown for the five priority-specific message channels. Defaults to `ntfy 消息`.     |
 
 
 #### NtfyMessage

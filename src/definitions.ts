@@ -26,7 +26,9 @@ export interface NtfyStartOptions {
   foregroundText?: string;
   serviceChannelId?: string;
   serviceChannelName?: string;
+  /** Base ID for five priority-specific message channels. Defaults to `capacitor_ntfy_messages`. */
   messageChannelId?: string;
+  /** Base name shown for the five priority-specific message channels. Defaults to `ntfy 消息`. */
   messageChannelName?: string;
 }
 

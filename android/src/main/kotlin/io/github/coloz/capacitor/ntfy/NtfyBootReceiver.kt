@@ -11,11 +11,18 @@ class NtfyBootReceiver : BroadcastReceiver() {
         val store = NtfyStore(context)
         val config = store.loadConfig() ?: return
         if (!store.isEnabled() || !config.autoStartOnBoot) return
+        if (NtfyProcessExit.wasStoppedByUser(context)) {
+            store.setEnabled(false)
+            return
+        }
         runCatching {
+            ntfyServiceRuntime.markStarting()
             ContextCompat.startForegroundService(
                 context,
                 Intent(context, NtfyForegroundService::class.java).setAction(NtfyForegroundService.ACTION_START),
             )
+        }.onFailure {
+            ntfyServiceRuntime.markStopped()
         }
     }
 }

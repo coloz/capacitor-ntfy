@@ -24,7 +24,6 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import java.util.concurrent.ThreadLocalRandom
-import kotlin.math.min
 import org.json.JSONObject
 
 class NtfyForegroundService : Service() {
@@ -36,7 +35,9 @@ class NtfyForegroundService : Service() {
     @Volatile private var activeConnection: HttpURLConnection? = null
     @Volatile private var worker: Thread? = null
     @Volatile private var generation = 0L
+    @Volatile private var networkGeneration = 0L
     @Volatile private var currentConfig: NtfyConfig? = null
+    private var networkSnapshot = NtfyNetworkSnapshot(handle = null, available = false)
 
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) = networkChanged()
@@ -46,9 +47,11 @@ class NtfyForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        ntfyServiceRuntime.markRunning()
         store = NtfyStore(this)
         connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        networkAvailable = hasNetwork()
+        networkSnapshot = currentNetworkSnapshot()
+        networkAvailable = networkSnapshot.available
         runCatching { connectivityManager.registerDefaultNetworkCallback(networkCallback) }
     }
 
@@ -76,6 +79,7 @@ class NtfyForegroundService : Service() {
 
     override fun onDestroy() {
         generation += 1
+        ntfyServiceRuntime.markStopped()
         activeConnection?.disconnect()
         activeConnection = null
         synchronized(networkMonitor) { networkMonitor.notifyAll() }
@@ -98,24 +102,33 @@ class NtfyForegroundService : Service() {
     }
 
     private fun connectionLoop(config: NtfyConfig, runId: Long) {
-        var attempt = 0
+        val reconnectPolicy = NtfyReconnectPolicy()
         while (isActive(runId)) {
             if (!networkAvailable) {
+                reconnectPolicy.reset()
                 emitStatus("waitingForNetwork", false, null, null, runId)
                 waitForSignal(60_000L)
                 continue
             }
 
+            val connectionNetworkGeneration = networkGeneration
+            var connectedAtNanos: Long? = null
             try {
-                emitStatus(if (attempt == 0) "connecting" else "reconnecting", false, null, null, runId)
-                subscribe(config, runId)
+                emitStatus(if (reconnectPolicy.isRetrying) "reconnecting" else "connecting", false, null, null, runId)
+                subscribe(config, runId) { connectedAtNanos = System.nanoTime() }
                 if (!isActive(runId)) return
                 throw IOException("ntfy stream ended")
             } catch (error: Exception) {
                 if (!isActive(runId)) return
-                if (!networkAvailable) continue
-                attempt += 1
-                val retrySeconds = min(60, 1 shl min(attempt, 6))
+                if (!networkAvailable || connectionNetworkGeneration != networkGeneration) {
+                    reconnectPolicy.reset()
+                    continue
+                }
+                val wasStable = connectedAtNanos?.let {
+                    System.nanoTime() - it >= STABLE_CONNECTION_NANOS
+                } ?: false
+                if (wasStable) reconnectPolicy.reset()
+                val retrySeconds = reconnectPolicy.nextDelaySeconds()
                 emitStatus(
                     state = "reconnecting",
                     connected = false,
@@ -132,7 +145,7 @@ class NtfyForegroundService : Service() {
         }
     }
 
-    private fun subscribe(config: NtfyConfig, runId: Long) {
+    private fun subscribe(config: NtfyConfig, runId: Long, onConnected: () -> Unit) {
         val since = store.getLastMessageId(config) ?: config.initialSince
         val encodedSince = URLEncoder.encode(since, Charsets.UTF_8.name())
         val topics = config.topics.joinToString(",")
@@ -153,6 +166,7 @@ class NtfyForegroundService : Service() {
             throw IOException("ntfy HTTP $responseCode${detail?.let { ": $it" } ?: ""}")
         }
 
+        onConnected()
         emitStatus("connected", true, null, null, runId)
         BufferedReader(InputStreamReader(connection.inputStream, Charsets.UTF_8)).use { reader ->
             while (isActive(runId)) {
@@ -235,9 +249,24 @@ class NtfyForegroundService : Service() {
                 setShowBadge(false)
             },
         )
-        manager.createNotificationChannel(
-            NotificationChannel(config.messageChannelId, config.messageChannelName, NotificationManager.IMPORTANCE_HIGH),
-        )
+        (1..5).forEach { priority ->
+            val profile = ntfyNotificationProfile(priority)
+            manager.createNotificationChannel(
+                NotificationChannel(
+                    profile.channelId(config.messageChannelId),
+                    "${config.messageChannelName}（${profile.channelNameSuffix}）",
+                    profile.importance,
+                ).apply {
+                    description = "ntfy 优先级 ${profile.priority} 消息"
+                    if (profile.vibrationPattern == null) {
+                        enableVibration(false)
+                    } else {
+                        enableVibration(true)
+                        vibrationPattern = profile.vibrationPattern
+                    }
+                },
+            )
+        }
     }
 
     private fun startOrUpdateForeground(config: NtfyConfig, text: String) {
@@ -257,25 +286,18 @@ class NtfyForegroundService : Service() {
 
     private fun showMessageNotification(message: JSONObject, config: NtfyConfig) {
         val id = message.optString("id", System.nanoTime().toString()).hashCode() and 0x7fffffff
-        val notification = NotificationCompat.Builder(this, config.messageChannelId)
+        val profile = ntfyNotificationProfile(message.optInt("priority", 3))
+        val notification = NotificationCompat.Builder(this, profile.channelId(config.messageChannelId))
             .setSmallIcon(notificationIcon())
             .setContentTitle(message.optString("title").ifBlank { message.optString("topic", "ntfy") })
             .setContentText(message.optString("message"))
             .setStyle(NotificationCompat.BigTextStyle().bigText(message.optString("message")))
             .setContentIntent(appPendingIntent(id))
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
-            .setPriority(notificationPriority(message.optInt("priority", 3)))
+            .setPriority(profile.compatPriority)
             .setAutoCancel(true)
             .build()
         runCatching { NotificationManagerCompat.from(this).notify(MESSAGE_NOTIFICATION_BASE + id % 100_000, notification) }
-    }
-
-    private fun notificationPriority(value: Int): Int = when (value) {
-        5 -> NotificationCompat.PRIORITY_MAX
-        4 -> NotificationCompat.PRIORITY_HIGH
-        2 -> NotificationCompat.PRIORITY_LOW
-        1 -> NotificationCompat.PRIORITY_MIN
-        else -> NotificationCompat.PRIORITY_DEFAULT
     }
 
     private fun notificationIcon(): Int = applicationInfo.icon.takeIf { it != 0 }
@@ -294,17 +316,24 @@ class NtfyForegroundService : Service() {
     }
 
     private fun networkChanged() {
-        val available = hasNetwork()
-        val changed = available != networkAvailable
-        networkAvailable = available
+        val nextSnapshot = currentNetworkSnapshot()
+        val changed = synchronized(networkMonitor) {
+            val value = nextSnapshot != networkSnapshot
+            networkSnapshot = nextSnapshot
+            networkAvailable = nextSnapshot.available
+            if (value) networkGeneration += 1
+            networkMonitor.notifyAll()
+            value
+        }
         if (changed) activeConnection?.disconnect()
-        synchronized(networkMonitor) { networkMonitor.notifyAll() }
     }
 
-    private fun hasNetwork(): Boolean {
-        val network = connectivityManager.activeNetwork ?: return false
-        val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return false
-        return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    private fun currentNetworkSnapshot(): NtfyNetworkSnapshot {
+        val network = connectivityManager.activeNetwork
+            ?: return NtfyNetworkSnapshot(handle = null, available = false)
+        val capabilities = connectivityManager.getNetworkCapabilities(network)
+        val available = capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
+        return NtfyNetworkSnapshot(handle = network.networkHandle, available = available)
     }
 
     private fun waitForSignal(milliseconds: Long) {
@@ -320,5 +349,6 @@ class NtfyForegroundService : Service() {
         const val ACTION_STOP = "io.github.coloz.capacitor.ntfy.STOP"
         private const val FOREGROUND_NOTIFICATION_ID = 42_600
         private const val MESSAGE_NOTIFICATION_BASE = 50_000
+        private const val STABLE_CONNECTION_NANOS = 30_000_000_000L
     }
 }

@@ -34,6 +34,7 @@ class NtfyPlugin : Plugin(), NtfyEventListener {
 
     override fun load() {
         store = NtfyStore(context)
+        reconcilePreviousExit()
         NtfyEventBus.add(this)
     }
 
@@ -57,12 +58,14 @@ class NtfyPlugin : Plugin(), NtfyEventListener {
                 put("topics", org.json.JSONArray(config.topics))
             }
             store.saveStatus(starting)
+            ntfyServiceRuntime.markStarting()
             ContextCompat.startForegroundService(
                 context,
                 Intent(context, NtfyForegroundService::class.java).setAction(NtfyForegroundService.ACTION_START),
             )
             call.resolve(statusObject())
         } catch (error: Exception) {
+            ntfyServiceRuntime.markStopped()
             store.setEnabled(false)
             call.reject("Unable to start the ntfy foreground service", error)
         }
@@ -71,6 +74,7 @@ class NtfyPlugin : Plugin(), NtfyEventListener {
     @PluginMethod
     fun stop(call: PluginCall) {
         store.setEnabled(false)
+        ntfyServiceRuntime.markStopped()
         context.stopService(Intent(context, NtfyForegroundService::class.java))
         val stopped = JSONObject().apply {
             put("state", "stopped")
@@ -269,7 +273,55 @@ class NtfyPlugin : Plugin(), NtfyEventListener {
         }
     }
 
-    private fun statusObject(): JSObject = enrichStatus(store.getStatus(store.loadConfig()))
+    private fun statusObject(): JSObject {
+        val config = store.loadConfig()
+        var status = store.getStatus(config)
+        if (status.optBoolean("running") && !ntfyServiceRuntime.isExpectedActive()) {
+            status = stoppedStatus(config)
+            store.saveStatus(status)
+        }
+        return enrichStatus(status)
+    }
+
+    private fun reconcilePreviousExit() {
+        if (!store.isEnabled() || ntfyServiceRuntime.isExpectedActive()) return
+        val config = store.loadConfig()
+        if (config == null || NtfyProcessExit.wasStoppedByUser(context)) {
+            store.setEnabled(false)
+            store.saveStatus(stoppedStatus(config))
+            return
+        }
+
+        val starting = JSONObject().apply {
+            put("state", "starting")
+            put("running", true)
+            put("connected", false)
+            put("baseUrl", config.baseUrl)
+            put("topics", org.json.JSONArray(config.topics))
+        }
+        store.saveStatus(starting)
+        ntfyServiceRuntime.markStarting()
+        runCatching {
+            ContextCompat.startForegroundService(
+                context,
+                Intent(context, NtfyForegroundService::class.java).setAction(NtfyForegroundService.ACTION_START),
+            )
+        }.onFailure {
+            ntfyServiceRuntime.markStopped()
+            store.saveStatus(stoppedStatus(config))
+        }
+    }
+
+    private fun stoppedStatus(config: NtfyConfig?): JSONObject = JSONObject().apply {
+        put("state", "stopped")
+        put("running", false)
+        put("connected", false)
+        if (config != null) {
+            put("baseUrl", config.baseUrl)
+            put("topics", org.json.JSONArray(config.topics))
+            store.getLastMessageId(config)?.let { put("lastMessageId", it) }
+        }
+    }
 
     private fun enrichStatus(status: JSONObject): JSObject {
         val powerManager = context.getSystemService(PowerManager::class.java)
